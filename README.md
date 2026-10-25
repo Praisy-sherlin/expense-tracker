@@ -2,7 +2,7 @@
 
 A Python + SQLite app that turns a bank statement (CSV) into spending insights on a Streamlit dashboard. Built to practise real-world SQL and DBMS concepts.
 
-**Live demo:** _add your Streamlit link here_
+Live demo: https://praisysherlin-expense-tracker.streamlit.app/
 
 > After opening the app, upload `data/sample.csv` from the sidebar to see the dashboard.
 
