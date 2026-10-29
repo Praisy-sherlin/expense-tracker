@@ -82,16 +82,29 @@ def init_db():
 
     # 3. Main tables
     conn.execute("""
+    CREATE TABLE IF NOT EXISTS statements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT NOT NULL,
+        imported_at TEXT DEFAULT (datetime('now', 'localtime'))
+    )
+    """)
+    conn.execute("""
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT,
         description TEXT,
         amount REAL,
         category_id INTEGER NOT NULL,
+        statement_id INTEGER,
         UNIQUE(date, description, amount),
-        FOREIGN KEY (category_id) REFERENCES categories(id)
+        FOREIGN KEY (category_id) REFERENCES categories(id),
+        FOREIGN KEY (statement_id) REFERENCES statements(id)
     )
     """)
+    # databases made by an older version do not have statement_id yet
+    if "statement_id" not in column_names(conn, "transactions"):
+        conn.execute(
+            "ALTER TABLE transactions ADD COLUMN statement_id INTEGER REFERENCES statements(id)")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS budgets (
         category_id INTEGER PRIMARY KEY,
@@ -129,6 +142,14 @@ def init_db():
         """)
         conn.execute("DROP TABLE budgets_old")
 
+    # rows imported before statements existed belong to one "Earlier data" statement
+    orphans = conn.execute(
+        "SELECT COUNT(*) FROM transactions WHERE statement_id IS NULL").fetchone()[0]
+    if orphans:
+        cur_s = conn.execute("INSERT INTO statements (filename) VALUES ('Earlier data')")
+        conn.execute("UPDATE transactions SET statement_id = ? WHERE statement_id IS NULL",
+                     (cur_s.lastrowid,))
+
     # 4. Indexes (speed up category + date lookups)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tx_category_date ON transactions(category_id, date)"
@@ -137,9 +158,10 @@ def init_db():
     # 5. Views
     conn.execute("""
     CREATE VIEW transaction_details AS
-    SELECT t.id, t.date, t.description, t.amount, c.name AS category
+    SELECT t.id, t.date, t.description, t.amount, c.name AS category, s.filename AS statement
     FROM transactions t
     JOIN categories c ON c.id = t.category_id
+    LEFT JOIN statements s ON s.id = t.statement_id
     """)
     conn.execute("""
     CREATE VIEW monthly_summary AS
@@ -201,8 +223,9 @@ def categorize(description, rules, others_id):
     return others_id
 
 
-def import_csv(file_bytes, others_id):
-    """ACID import: either ALL rows are saved, or NONE (rollback on any bad row)."""
+def import_csv(file_bytes, others_id, filename="statement.csv"):
+    """ACID import: either ALL rows are saved, or NONE (rollback on any bad row).
+    Every import is recorded as a statement, so it can be removed later."""
     text = file_bytes.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
 
@@ -216,7 +239,10 @@ def import_csv(file_bytes, others_id):
     cur = conn.cursor()
     count = 0
     total = 0
+    statement_id = None
     try:
+        cur.execute("INSERT INTO statements (filename) VALUES (?)", (filename,))
+        statement_id = cur.lastrowid
         for line_no, raw in enumerate(reader, start=2):  # line 1 = header
             row = {k.strip().lower(): (v or "").strip() for k, v in raw.items() if k}
 
@@ -237,19 +263,65 @@ def import_csv(file_bytes, others_id):
 
             total += 1
             cur.execute(
-                "INSERT OR IGNORE INTO transactions (date, description, amount, category_id) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO transactions "
+                "(date, description, amount, category_id, statement_id) VALUES (?, ?, ?, ?, ?)",
                 (row["date"], row["description"], amount,
-                 categorize(row["description"], rules, others_id))
+                 categorize(row["description"], rules, others_id), statement_id)
             )
             count += cur.rowcount
+        if count == 0:     # nothing new: do not keep an empty statement
+            cur.execute("DELETE FROM statements WHERE id = ?", (statement_id,))
+            statement_id = None
         conn.commit()      # everything is valid -> save all rows
     except Exception:
         conn.rollback()    # something failed -> save nothing
         raise
     finally:
         conn.close()
-    return count, total
+    return count, total, statement_id
+
+
+def list_statements():
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT s.id, s.filename, s.imported_at, COUNT(t.id), COALESCE(SUM(t.amount), 0)
+        FROM statements s
+        LEFT JOIN transactions t ON t.statement_id = s.id
+        GROUP BY s.id
+        ORDER BY s.id DESC
+    """).fetchall()
+    conn.close()
+    return rows
+
+
+def remove_statement(statement_id):
+    """Delete a statement together with every transaction that came from it."""
+    conn = get_conn()
+    try:
+        n = conn.execute("DELETE FROM transactions WHERE statement_id = ?",
+                         (statement_id,)).rowcount
+        conn.execute("DELETE FROM statements WHERE id = ?", (statement_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return n
+
+
+def remove_all_statements():
+    conn = get_conn()
+    try:
+        n = conn.execute("DELETE FROM transactions").rowcount
+        conn.execute("DELETE FROM statements")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return n
 
 
 def run_performance_test(n_rows=100_000, runs=20):
@@ -408,6 +480,11 @@ header[data-testid="stHeader"]{background:transparent;}
 .step .t{font-size:14px;color:var(--text);font-weight:500;line-height:1.3;}
 .step .d{font-size:12.5px;color:var(--muted);margin-top:2px;line-height:1.4;}
 .step.pending .t{color:var(--muted);}
+
+/* ---------- imported statements (sidebar) ---------- */
+.stmt{padding:6px 0;min-width:0;}
+.stmt-name{font-size:13.5px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.stmt-meta{font-size:12px;color:var(--muted);margin-top:2px;}
 
 /* ---------- empty state ---------- */
 .empty{display:flex;flex-direction:column;align-items:center;text-align:center;padding:46px 20px 40px;background:var(--s2);border:1px dashed var(--outline);border-radius:24px;margin-top:18px;}
@@ -664,13 +741,28 @@ tab_overview, tab_insights, tab_tx, tab_manage, tab_lab = st.tabs([
 # =====================================================================
 # Sidebar, step 1: import a statement (all-or-nothing)
 # =====================================================================
+# one-time message saved before a rerun
+if "flash" in st.session_state:
+    flash_msg, flash_icon = st.session_state.pop("flash")
+    st.toast(flash_msg, icon=flash_icon)
+
+
+def reset_uploader():
+    """Empty the file box and forget the current import."""
+    for k in ("import_id", "import_result", "import_statement_id", "import_filename"):
+        st.session_state.pop(k, None)
+    st.session_state["uploader_n"] = st.session_state.get("uploader_n", 0) + 1
+
+
 with st.sidebar:
     st.markdown(
         '<div class="side-title">Import statement</div>'
         '<div class="side-sub">CSV with date, description and amount columns.</div>',
         unsafe_allow_html=True)
-    uploaded = st.file_uploader("Bank statement CSV", type="csv", label_visibility="collapsed")
+    uploaded = st.file_uploader("Bank statement CSV", type="csv", label_visibility="collapsed",
+                                key="uploader_" + str(st.session_state.get("uploader_n", 0)))
     import_slot = st.container()
+    statements_slot = st.container()
     st.divider()
     stepper_slot = st.container()
 
@@ -679,8 +771,12 @@ if uploaded is not None:
     file_id = getattr(uploaded, "file_id", None) or (getattr(uploaded, "name", ""), len(data_bytes))
     if st.session_state.get("import_id") != file_id:      # process each uploaded file once
         st.session_state["import_id"] = file_id
+        st.session_state["import_statement_id"] = None
+        file_name = getattr(uploaded, "name", "statement.csv")
         try:
-            added, total_rows = import_csv(data_bytes, others_id)
+            added, total_rows, new_statement_id = import_csv(data_bytes, others_id, file_name)
+            st.session_state["import_statement_id"] = new_statement_id
+            st.session_state["import_filename"] = file_name
             skipped = total_rows - added
             if added:
                 msg = str(added) + " new transactions added."
@@ -702,8 +798,15 @@ if uploaded is not None:
             st.session_state["import_result"] = (
                 "err", "Upload failed: " + esc(e) + " Nothing was saved (rolled back).")
 else:
+    # the file was removed with the x button: its transactions go with it
+    removed_id = st.session_state.pop("import_statement_id", None)
+    removed_name = st.session_state.pop("import_filename", "statement")
     st.session_state.pop("import_id", None)
     st.session_state.pop("import_result", None)
+    if removed_id:
+        removed_rows = remove_statement(removed_id)
+        st.toast("Removed " + removed_name + " and its " + str(removed_rows) + " transactions.",
+                 icon=":material/delete:")
 
 if st.session_state.get("import_result"):
     kind, text = st.session_state["import_result"]
@@ -711,6 +814,40 @@ if st.session_state.get("import_result"):
         alert({"ok": "ok", "info": "info", "err": "err"}[kind], text,
               {"ok": "check", "info": "check", "err": "alert"}[kind]),
         unsafe_allow_html=True)
+
+# ---------- imported statements: remove one, its transactions go with it ----------
+statement_rows = list_statements()
+with statements_slot:
+    if statement_rows:
+        st.markdown(
+            '<div class="side-title" style="margin-top:20px">Imported statements</div>'
+            '<div class="side-sub" style="margin-bottom:6px">Remove one and its transactions go with it.</div>',
+            unsafe_allow_html=True)
+        to_remove = None
+        for sid, fname, imported_at, n_rows, amt_sum in statement_rows:
+            c_info, c_btn = st.columns([5, 1.6], vertical_alignment="center")
+            c_info.markdown(
+                '<div class="stmt"><div class="stmt-name">%s</div><div class="stmt-meta">%d transactions, %s</div></div>'
+                % (esc(fname), n_rows, inr(amt_sum)), unsafe_allow_html=True)
+            if c_btn.button(":material/delete:", key="rm_stmt_" + str(sid), help="Remove this statement"):
+                to_remove = (sid, fname)
+        remove_everything = len(statement_rows) > 1 and st.button(
+            "Remove all statements", key="rm_all_stmts")
+
+        if to_remove:
+            removed_rows = remove_statement(to_remove[0])
+            if to_remove[0] == st.session_state.get("import_statement_id"):
+                reset_uploader()
+            st.session_state["flash"] = (
+                "Removed " + to_remove[1] + " and its " + str(removed_rows) + " transactions.",
+                ":material/delete:")
+            st.rerun()
+        if remove_everything:
+            removed_rows = remove_all_statements()
+            reset_uploader()
+            st.session_state["flash"] = (
+                "Removed all statements (" + str(removed_rows) + " transactions).", ":material/delete:")
+            st.rerun()
 
 # =====================================================================
 # Manage tab: budgets, rules, delete (actions run before data is read)
@@ -1151,6 +1288,7 @@ with tab_tx:
                 "description": st.column_config.TextColumn("Description", width="large"),
                 "amount": st.column_config.NumberColumn("Amount", format="₹ %.2f"),
                 "category": st.column_config.TextColumn("Category", width="small"),
+                "statement": st.column_config.TextColumn("Statement", width="medium"),
             },
             **_STRETCH_DF)
 
@@ -1178,11 +1316,11 @@ with tab_lab:
     st.markdown('<div class="sec-title" style="margin-top:10px">What is inside the database</div>',
                 unsafe_allow_html=True)
     counts = {t: conn.execute("SELECT COUNT(*) FROM " + t).fetchone()[0]
-              for t in ["categories", "category_rules", "transactions", "budgets", "audit_log"]}
+              for t in ["categories", "category_rules", "statements", "transactions", "budgets", "audit_log"]}
     st.markdown(
-        '<div class="kpis" style="grid-template-columns:repeat(5,minmax(0,1fr))">'
+        '<div class="kpis" style="grid-template-columns:repeat(3,minmax(0,1fr))">'
         + "".join(kpi("database", col, name, str(counts[name]), "rows")
-                  for name, col in zip(counts, [PRIMARY, "#C3A6FF", MINT, AMBER, "#FF9E9E"]))
+                  for name, col in zip(counts, [PRIMARY, "#C3A6FF", "#7DC4FF", MINT, AMBER, "#FF9E9E"]))
         + '</div>', unsafe_allow_html=True)
 
     lab_a, lab_b = st.columns(2, gap="medium")
@@ -1203,11 +1341,12 @@ with tab_lab:
         with st.container(key="card_perf"):
             card_title("Index performance test",
                        "100,000 fake rows in a temporary in-memory database. Your data is not touched.")
+            perf_result = None
             if st.button("Run performance test", type="primary", key="run_perf"):
                 with st.spinner("Generating 100,000 rows and timing the query..."):
-                    st.session_state["perf"] = run_performance_test()
-            if "perf" in st.session_state:
-                q, plan_b, before_ms, plan_a, after_ms = st.session_state["perf"]
+                    perf_result = run_performance_test()   # shown only for this run
+            if perf_result is not None:
+                q, plan_b, before_ms, plan_a, after_ms = perf_result
                 fig = go.Figure(go.Bar(
                     y=["Without index", "With index"], x=[before_ms, after_ms], orientation="h",
                     marker_color=[AMBER, MINT],
